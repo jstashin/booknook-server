@@ -16,7 +16,6 @@ if (!process.env.MONGODB_URI) {
 
 const client = new MongoClient(process.env.MONGODB_URI);
 const jwks = createRemoteJWKSet(new URL("/api/auth/jwks", clientUrl));
-
 const categories = ["Fiction", "Science", "History", "Kids", "Others"];
 
 const listFields = {
@@ -31,6 +30,18 @@ const listFields = {
 
 app.use(cors({ origin: clientUrl }));
 app.use(express.json());
+
+function apiError(status, message) {
+  return Object.assign(new Error(message), { status });
+}
+
+function objectId(value) {
+  if (typeof value !== "string" || !/^[a-f0-9]{24}$/i.test(value)) {
+    throw apiError(400, "Invalid ID.");
+  }
+
+  return new ObjectId(value);
+}
 
 async function verifyToken(req, res, next) {
   const token = req.get("authorization")?.match(/^Bearer\s+(\S+)$/i)?.[1];
@@ -69,16 +80,14 @@ async function verifyToken(req, res, next) {
   return next();
 }
 
-function validText(value, maxLength) {
-  return (
+function readBookFields(body, coverHosts) {
+  const { title, author, category, description, image, totalCopies } =
+    body || {};
+
+  const validText = (value, maxLength) =>
     typeof value === "string" &&
     value.trim().length > 0 &&
-    value.trim().length <= maxLength
-  );
-}
-
-function readBookFields(body, allowedCoverHosts) {
-  const { title, author, category, description, image, totalCopies } = body || {};
+    value.trim().length <= maxLength;
 
   if (
     !validText(title, 150) ||
@@ -89,7 +98,7 @@ function readBookFields(body, allowedCoverHosts) {
     totalCopies < 1 ||
     totalCopies > 10000
   ) {
-    return { error: "Check the book details and total copies." };
+    throw apiError(400, "Check the book details and total copies.");
   }
 
   let cover;
@@ -97,40 +106,35 @@ function readBookFields(body, allowedCoverHosts) {
   try {
     cover = new URL(image);
   } catch {
-    return { error: "Invalid cover URL." };
+    throw apiError(400, "Invalid cover URL.");
   }
 
-  if (
-    cover.protocol !== "https:" ||
-    !allowedCoverHosts.includes(cover.hostname)
-  ) {
-    return { error: "Use a supported book cover URL." };
+  if (cover.protocol !== "https:" || !coverHosts.includes(cover.hostname)) {
+    throw apiError(400, "Use a supported book cover URL.");
   }
 
   return {
-    book: {
-      title: title.trim(),
-      author: author.trim(),
-      category,
-      description: description.trim(),
-      image: cover.href,
-      totalCopies,
-    },
+    title: title.trim(),
+    author: author.trim(),
+    category,
+    description: description.trim(),
+    image: cover.href,
+    totalCopies,
   };
 }
 
-export async function connectToMongoDB() {
-  await client.connect();
-  console.log("MongoDB connected successfully.");
-  return client;
-}
-
 async function startServer() {
-  const mongoClient = await connectToMongoDB();
-  const db = mongoClient.db("booknook");
-  const booksCollection = db.collection("books");
+  await client.connect();
 
-  await booksCollection.createIndex({ createdAt: -1, _id: -1 });
+  const db = client.db("booknook");
+  const books = db.collection("books");
+  const borrows = db.collection("borrows");
+
+  await Promise.all([
+    books.createIndex({ createdAt: -1, _id: -1 }),
+    borrows.createIndex({ bookId: 1, userId: 1 }, { unique: true }),
+    borrows.createIndex({ userId: 1, borrowDate: -1 }),
+  ]);
 
   app.get(
     "/books",
@@ -142,205 +146,258 @@ async function startServer() {
       return next();
     },
     async (req, res) => {
-      try {
-        const { limit, mine } = req.query;
-        const ownBooks = mine === "true";
-        const filter = ownBooks ? { ownerId: req.user.id } : {};
-        const projection = ownBooks
-          ? { ...listFields, description: 1 }
-          : listFields;
+      const { mine, limit } = req.query;
+      const ownBooks = mine === "true";
+      const filter = ownBooks ? { ownerId: req.user.id } : {};
+      const projection = ownBooks
+        ? { ...listFields, description: 1 }
+        : listFields;
 
-        const cursor = booksCollection
-          .find(filter, { projection })
-          .sort({ createdAt: -1, _id: -1 });
+      const cursor = books.find(filter, { projection }).sort({
+        createdAt: -1,
+        _id: -1,
+      });
 
-        if (limit !== undefined) {
-          const parsedLimit = Number(limit);
+      if (limit !== undefined) {
+        const parsedLimit = Number(limit);
 
-          if (
-            typeof limit !== "string" ||
-            !Number.isInteger(parsedLimit) ||
-            parsedLimit < 1 ||
-            parsedLimit > 100
-          ) {
-            return res.status(400).json({
-              message: "Limit must be an integer between 1 and 100.",
-            });
-          }
-
-          cursor.limit(parsedLimit);
+        if (
+          typeof limit !== "string" ||
+          !Number.isInteger(parsedLimit) ||
+          parsedLimit < 1 ||
+          parsedLimit > 100
+        ) {
+          throw apiError(400, "Limit must be an integer between 1 and 100.");
         }
 
-        return res.json(await cursor.toArray());
-      } catch (error) {
-        console.error("Failed to fetch books:", error.message);
-        return res.status(500).json({ message: "Could not load books." });
+        cursor.limit(parsedLimit);
       }
+
+      return res.json(await cursor.toArray());
     }
   );
 
   app.get("/books/:id", verifyToken, async (req, res) => {
-    const { id } = req.params;
-
-    if (!/^[a-f0-9]{24}$/i.test(id)) {
-      return res.status(400).json({ message: "Invalid book ID." });
-    }
-
-    try {
-      const book = await booksCollection.findOne(
-        { _id: new ObjectId(id) },
-        {
-          projection: {
-            ...listFields,
-            description: 1,
-            "addedBy.name": 1,
-          },
-        }
-      );
-
-      if (!book) {
-        return res.status(404).json({ message: "Book not found." });
+    const book = await books.findOne(
+      { _id: objectId(req.params.id) },
+      {
+        projection: {
+          ...listFields,
+          description: 1,
+          "addedBy.name": 1,
+        },
       }
+    );
 
-      return res.json(book);
-    } catch (error) {
-      console.error("Failed to load book:", error.message);
-      return res.status(500).json({ message: "Could not load this book." });
+    if (!book) {
+      throw apiError(404, "Book not found.");
     }
+
+    return res.json(book);
   });
 
   app.post("/books", verifyToken, async (req, res) => {
-    const { book, error } = readBookFields(req.body, ["i.ibb.co"]);
+    const book = readBookFields(req.body, ["i.ibb.co"]);
 
-    if (error) {
-      return res.status(400).json({ message: error });
-    }
+    const result = await books.insertOne({
+      ...book,
+      availableCopies: book.totalCopies,
+      ownerId: req.user.id,
+      addedBy: {
+        name: req.user.name,
+        email: req.user.email,
+      },
+      createdAt: new Date(),
+    });
 
-    try {
-      const result = await booksCollection.insertOne({
-        ...book,
-        availableCopies: book.totalCopies,
-        ownerId: req.user.id,
-        addedBy: {
-          name: req.user.name,
-          email: req.user.email,
-        },
-        createdAt: new Date(),
-      });
-
-      return res.status(201).json({
-        message: "Book added successfully.",
-        insertedId: result.insertedId,
-      });
-    } catch (error) {
-      console.error("Failed to save book:", error.message);
-      return res.status(500).json({ message: "Could not save the book." });
-    }
+    return res.status(201).json({
+      message: "Book added successfully.",
+      insertedId: result.insertedId,
+    });
   });
 
   app.patch("/books/:id", verifyToken, async (req, res) => {
-    const { id } = req.params;
+    const ownerFilter = {
+      _id: objectId(req.params.id),
+      ownerId: req.user.id,
+    };
 
-    if (!/^[a-f0-9]{24}$/i.test(id)) {
-      return res.status(400).json({ message: "Invalid book ID." });
-    }
-
-    const { book, error } = readBookFields(req.body, [
+    const book = readBookFields(req.body, [
       "i.ibb.co",
       "covers.openlibrary.org",
     ]);
-
-    if (error) {
-      return res.status(400).json({ message: error });
-    }
-
-    const ownerFilter = {
-      _id: new ObjectId(id),
-      ownerId: req.user.id,
-    };
 
     const copiesOnLoan = {
       $subtract: ["$totalCopies", "$availableCopies"],
     };
 
-    try {
-      const result = await booksCollection.updateOne(
+    const result = await books.updateOne(
+      {
+        ...ownerFilter,
+        $expr: { $lte: [copiesOnLoan, book.totalCopies] },
+      },
+      [
         {
-          ...ownerFilter,
-          $expr: { $lte: [copiesOnLoan, book.totalCopies] },
-        },
-        [
-          {
-            $set: {
-              title: { $literal: book.title },
-              author: { $literal: book.author },
-              category: { $literal: book.category },
-              description: { $literal: book.description },
-              image: { $literal: book.image },
-              totalCopies: book.totalCopies,
-              availableCopies: {
-                $subtract: [book.totalCopies, copiesOnLoan],
-              },
-              updatedAt: "$$NOW",
+          $set: {
+            title: { $literal: book.title },
+            author: { $literal: book.author },
+            category: { $literal: book.category },
+            description: { $literal: book.description },
+            image: { $literal: book.image },
+            totalCopies: book.totalCopies,
+            availableCopies: {
+              $subtract: [book.totalCopies, copiesOnLoan],
             },
+            updatedAt: "$$NOW",
           },
-        ]
-      );
+        },
+      ]
+    );
 
-      if (result.matchedCount) {
-        return res.json({ message: "Book updated successfully." });
-      }
-
-      const ownedBook = await booksCollection.findOne(ownerFilter);
-
-      if (!ownedBook) {
-        return res.status(404).json({ message: "Your book was not found." });
-      }
-
-      return res.status(409).json({
-        message: "Total copies cannot be lower than the number on loan.",
-      });
-    } catch (error) {
-      console.error("Failed to update book:", error.message);
-      return res.status(500).json({ message: "Could not update the book." });
+    if (result.matchedCount) {
+      return res.json({ message: "Book updated successfully." });
     }
+
+    if (!(await books.findOne(ownerFilter))) {
+      throw apiError(404, "Your book was not found.");
+    }
+
+    throw apiError(409, "Total copies cannot be lower than the number on loan.");
   });
 
   app.delete("/books/:id", verifyToken, async (req, res) => {
-    const { id } = req.params;
-
-    if (!/^[a-f0-9]{24}$/i.test(id)) {
-      return res.status(400).json({ message: "Invalid book ID." });
-    }
-
     const ownerFilter = {
-      _id: new ObjectId(id),
+      _id: objectId(req.params.id),
       ownerId: req.user.id,
     };
 
-    try {
-      const result = await booksCollection.deleteOne({
-        ...ownerFilter,
-        $expr: { $eq: ["$availableCopies", "$totalCopies"] },
-      });
+    const result = await books.deleteOne({
+      ...ownerFilter,
+      $expr: { $eq: ["$availableCopies", "$totalCopies"] },
+    });
 
-      if (result.deletedCount) {
-        return res.sendStatus(204);
-      }
-
-      const ownedBook = await booksCollection.findOne(ownerFilter);
-
-      if (!ownedBook) {
-        return res.status(404).json({ message: "Your book was not found." });
-      }
-
-      return res.status(409).json({
-        message: "Return all borrowed copies before deleting this book.",
-      });
-    } catch (error) {
-      console.error("Failed to delete book:", error.message);
-      return res.status(500).json({ message: "Could not delete the book." });
+    if (result.deletedCount) {
+      return res.sendStatus(204);
     }
+
+    if (!(await books.findOne(ownerFilter))) {
+      throw apiError(404, "Your book was not found.");
+    }
+
+    throw apiError(409, "Return all borrowed copies before deleting this book.");
+  });
+
+  app.post("/borrows", verifyToken, async (req, res) => {
+    const bookId = objectId(req.body?.bookId);
+    const userId = req.user.id;
+
+    const result = await client.withSession((session) =>
+      session.withTransaction(async () => {
+        const existingLoan = await borrows.findOne(
+          { bookId, userId },
+          { session }
+        );
+
+        if (existingLoan) {
+          throw apiError(409, "You already borrowed this book.");
+        }
+
+        const book = await books.findOneAndUpdate(
+          { _id: bookId, availableCopies: { $gt: 0 } },
+          { $inc: { availableCopies: -1 } },
+          { session, returnDocument: "after" }
+        );
+
+        if (!book) {
+          throw apiError(409, "This book is not available.");
+        }
+
+        const borrowDate = new Date();
+        const returnDate = new Date(
+          borrowDate.getTime() + 14 * 24 * 60 * 60 * 1000
+        );
+
+        return borrows.insertOne(
+          {
+            bookId,
+            userId,
+            email: req.user.email,
+            title: book.title,
+            image: book.image,
+            borrowDate,
+            returnDate,
+          },
+          { session }
+        );
+      })
+    );
+
+    return res.status(201).json({
+      message: "Book borrowed successfully.",
+      insertedId: result.insertedId,
+    });
+  });
+
+  app.get("/borrows", verifyToken, async (req, res) => {
+    const loans = await borrows
+      .find({ userId: req.user.id })
+      .sort({ borrowDate: -1 })
+      .toArray();
+
+    return res.json(loans);
+  });
+
+  app.delete("/borrows/:id", verifyToken, async (req, res) => {
+    const loanId = objectId(req.params.id);
+
+    await client.withSession((session) =>
+      session.withTransaction(async () => {
+        const loan = await borrows.findOneAndDelete(
+          { _id: loanId, userId: req.user.id },
+          { session }
+        );
+
+        if (!loan) {
+          throw apiError(404, "Your loan was not found.");
+        }
+
+        const result = await books.updateOne(
+          { _id: loan.bookId },
+          { $inc: { availableCopies: 1 } },
+          { session }
+        );
+
+        if (!result.matchedCount) {
+          throw apiError(409, "The book record is missing.");
+        }
+      })
+    );
+
+    return res.sendStatus(204);
+  });
+
+  app.use((req, res) => {
+    return res.status(404).json({ message: "API route not found." });
+  });
+
+  app.use((error, req, res, next) => {
+    if (res.headersSent) {
+      return next(error);
+    }
+
+    if (error.code === 11000) {
+      return res.status(409).json({ message: "You already borrowed this book." });
+    }
+
+    const status = error.status || 500;
+
+    if (status >= 500) {
+      console.error("BookNook API error:", error.message);
+    }
+
+    return res.status(status).json({
+      message: status < 500 ? error.message : "Something went wrong. Try again.",
+    });
   });
 
   app.listen(port, () => {
