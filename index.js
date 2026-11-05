@@ -404,12 +404,12 @@ await Promise.all([
     });
   });
 
+ if (!process.env.VERCEL) {
   app.listen(port, () => {
     console.log(`BookNook server is running on port ${port}`);
   });
+ }
+await startServer();
 }
 
-startServer().catch((error) => {
-  console.error("Server startup failed:", error.message);
-  process.exit(1);
-});
+export default app;
