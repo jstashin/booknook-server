@@ -30,6 +30,11 @@ const listFields = {
 
 app.use(cors({ origin: clientUrl }));
 app.use(express.json());
+app.get("/", (req, res) => {
+  res.json({
+    message: "BookNook server is running.",
+  });
+});
 
 function apiError(status, message) {
   return Object.assign(new Error(message), { status });
