@@ -409,7 +409,8 @@ await Promise.all([
     console.log(`BookNook server is running on port ${port}`);
   });
  }
-await startServer();
 }
+await startServer();
+
 
 export default app;
