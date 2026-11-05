@@ -130,11 +130,15 @@ async function startServer() {
   const books = db.collection("books");
   const borrows = db.collection("borrows");
 
-  await Promise.all([
-    books.createIndex({ createdAt: -1, _id: -1 }),
-    borrows.createIndex({ bookId: 1, userId: 1 }, { unique: true }),
-    borrows.createIndex({ userId: 1, borrowDate: -1 }),
-  ]);
+await Promise.all([
+  books.createIndexes([
+    { key: { createdAt: -1, _id: -1 } },
+  ]),
+  borrows.createIndexes([
+    { key: { bookId: 1, userId: 1 }, unique: true },
+    { key: { userId: 1, borrowDate: -1 } },
+  ]),
+]);
 
   app.get(
     "/books",
